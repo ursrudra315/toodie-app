@@ -1,0 +1,227 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: toodie-android-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+      RELEASES_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+    steps:
+      - name: Check out private source code
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD GOOGLE_SERVICES_JSON RELEASES_TOKEN; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing required secret: $name"
+              exit 1
+            fi
+          done
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install dependencies
+        run: |
+          npm install --global pnpm@9
+          pnpm install --no-frozen-lockfile
+
+      - name: Prepare image tools
+        run: pnpm rebuild sharp
+
+      - name: Build web app
+        run: pnpm build
+
+      - name: Add Android project if needed
+        run: |
+          if [ ! -d android ]; then
+            npx cap add android
+          fi
+
+      - name: Generate Android icons and splash
+        run: |
+          if ls resources/* >/dev/null 2>&1; then
+            npx @capacitor/assets generate --android \
+              --splashBackgroundColor '#000000' \
+              --splashBackgroundColorDark '#000000'
+          fi
+
+      - name: Sync native dependencies
+        run: npx cap sync android
+
+      - name: Configure Firebase and APK version
+        run: |
+          node --input-type=module <<'JS'
+          import fs from "node:fs";
+
+          const input = process.env.GOOGLE_SERVICES_JSON.trim();
+          const content = input.startsWith("{")
+            ? input
+            : Buffer.from(input, "base64").toString("utf8");
+          const config = JSON.parse(content);
+          if (!config.client?.some(client =>
+            client.client_info?.android_client_info?.package_name === "app.toodie"
+          )) {
+            throw new Error("Firebase configuration must contain package app.toodie");
+          }
+          fs.writeFileSync("android/app/google-services.json", content);
+
+          const rootPath = "android/build.gradle";
+          let root = fs.readFileSync(rootPath, "utf8");
+          if (!root.includes("com.google.gms:google-services")) {
+            if (!/dependencies\s*\{/.test(root)) {
+              throw new Error("Cannot find root Gradle dependencies block");
+            }
+            root = root.replace(/dependencies\s*\{/,
+              'dependencies {\n        classpath "com.google.gms:google-services:4.4.2"');
+            fs.writeFileSync(rootPath, root);
+          }
+
+          const appPath = "android/app/build.gradle";
+          let app = fs.readFileSync(appPath, "utf8");
+          if (!app.includes("com.google.gms.google-services")) {
+            app += '\napply plugin: "com.google.gms.google-services"\n';
+          }
+          if (!/versionCode\s+\d+/.test(app) || !/versionName\s+"[^"]*"/.test(app)) {
+            throw new Error("Cannot find Android version fields");
+          }
+          const version = process.env.GITHUB_RUN_NUMBER;
+          app = app.replace(/versionCode\s+\d+/, `versionCode ${version}`)
+            .replace(/versionName\s+"[^"]*"/, `versionName "1.${version}"`);
+          fs.writeFileSync(appPath, app);
+          JS
+
+      - name: Install native order voice service
+        run: node scripts/patch-android.mjs
+
+      - name: Configure payment links and Android app visibility
+        run: |
+          python3 <<'PY'
+          import xml.etree.ElementTree as ET
+
+          manifest = "android/app/src/main/AndroidManifest.xml"
+          namespace = "http://schemas.android.com/apk/res/android"
+          ET.register_namespace("android", namespace)
+          ET.register_namespace("tools", "http://schemas.android.com/tools")
+
+          def android(name):
+              return "{" + namespace + "}" + name
+
+          tree = ET.parse(manifest)
+          root = tree.getroot()
+          application = root.find("application")
+          activity = next((item for item in application.findall("activity")
+              if item.get(android("name"), "").endswith("MainActivity")), None)
+          if activity is None:
+              raise RuntimeError("MainActivity not found")
+
+          for scheme, host in [("toodie", "payment"), ("app.toodie", "auth")]:
+              exists = any(item.get(android("scheme")) == scheme
+                  and item.get(android("host")) == host
+                  for item in activity.findall("intent-filter/data"))
+              if not exists:
+                  intent = ET.SubElement(activity, "intent-filter")
+                  ET.SubElement(intent, "action", {
+                      android("name"): "android.intent.action.VIEW"})
+                  for category in ["DEFAULT", "BROWSABLE"]:
+                      ET.SubElement(intent, "category", {
+                          android("name"): "android.intent.category." + category})
+                  ET.SubElement(intent, "data", {
+                      android("scheme"): scheme, android("host"): host})
+
+          queries = root.find("queries")
+          if queries is None:
+              queries = ET.SubElement(root, "queries")
+          if not any(item.get(android("scheme")) == "upi"
+              for item in queries.findall("intent/data")):
+              intent = ET.SubElement(queries, "intent")
+              ET.SubElement(intent, "action", {
+                  android("name"): "android.intent.action.VIEW"})
+              ET.SubElement(intent, "data", {android("scheme"): "upi"})
+          existing = {item.get(android("name")) for item in queries.findall("package")}
+          for package in ["com.google.android.apps.nbu.paisa.user", "com.phonepe.app",
+              "net.one97.paytm", "in.org.npci.upiapp"]:
+              if package not in existing:
+                  ET.SubElement(queries, "package", {android("name"): package})
+          ET.indent(tree, space="    ")
+          tree.write(manifest, encoding="utf-8", xml_declaration=True)
+          PY
+
+      - name: Build and sign release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          KEYSTORE="$RUNNER_TEMP/toodie-release.keystore"
+          trap 'rm -f "$KEYSTORE"' EXIT
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+          chmod +x android/gradlew
+          (cd android && ./gradlew --no-daemon assembleRelease)
+          OUT="android/app/build/outputs/apk/release"
+          UNSIGNED="$OUT/app-release-unsigned.apk"
+          if [ ! -f "$UNSIGNED" ]; then
+            echo "::error::Expected unsigned release APK not found."
+            exit 1
+          fi
+          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          "$BT/zipalign" -f -p 4 "$UNSIGNED" "$OUT/app-release-aligned.apk"
+          "$BT/apksigner" sign \
+            --ks "$KEYSTORE" \
+            --ks-pass env:KEYSTORE_PASSWORD \
+            --ks-key-alias "$KEY_ALIAS" \
+            --key-pass env:KEY_PASSWORD \
+            --out "$OUT/toodie-release.apk" \
+            "$OUT/app-release-aligned.apk"
+          "$BT/apksigner" verify --verbose "$OUT/toodie-release.apk"
+          (cd "$OUT" && sha256sum toodie-release.apk > toodie-release.apk.sha256)
+
+      - name: Publish APK to public downloads repository
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ursrudra315/toodie-app
+          token: ${{ secrets.RELEASES_TOKEN }}
+          tag_name: android-${{ github.run_number }}
+          name: Toodie 1.${{ github.run_number }}
+          make_latest: true
+          fail_on_unmatched_files: true
+          body: |
+            ## Toodie for Android
+
+            Download **toodie-release.apk** from Assets below.
+            Open the downloaded file and allow installation from your browser
+            or file manager if Android requests it.
+
+            Existing users: install over the previous version.
+            Only the compiled Android app is published here.
+          files: |
+            android/app/build/outputs/apk/release/toodie-release.apk
+            android/app/build/outputs/apk/release/toodie-release.apk.sha256
